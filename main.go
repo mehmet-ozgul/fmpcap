@@ -12,9 +12,9 @@ import (
 
 var (
 	lossProbability       = flag.Float64("loss", 0.02, "Loss probability of each packet")
-	conseqLossProbability = flag.Float64("conseq", 0.25, "Loss probability of each *lost* packet")
-	delayAtLoss           = flag.Int("delay", 200, "Delay to introduce before sending the first packet after loss, in ms")
-	delayVar              = flag.Float64("delayVar", 0.1, "Max variance in delay at loss, proportinal to the delay value.")
+	conseqLossProbability = flag.Float64("conseq", 0.05, "Loss probability of each *lost* packet")
+	delayAtLoss           = flag.Int64("delay", 180, "Delay to introduce before sending the first packet after loss, in ms")
+	delayErr              = flag.Int64("delayErr", 40, "Total Delay = DelayAtLoss +- Err/2")
 	input                 = flag.String("input", "", "Input file")
 	output                = flag.String("output", "", "Output file")
 )
@@ -23,17 +23,26 @@ var (
 type Config struct {
 	LossProbability       float64
 	ConseqLossProbability float64
-	DelayAtLoss           int
-	DelayVar              float64
+	DelayAtLoss           int64
+	DelayErr              int64
 }
 
+func saneTime(t time.Time) int64 {
+	return (t.UnixNano() / 1000000) - 1600965000000
+}
+
+//nolint:gocognit
 func TranslateFile(input, output string, config Config) error {
 	fmt.Printf("Processing file [%v]\n", input)
 	fin, err := os.Open(input)
 	if err != nil {
 		return err
 	}
-	defer fin.Close()
+	defer func() {
+		if err := fin.Close(); err != nil {
+			fmt.Println("Failed to close the input put")
+		}
+	}()
 	r, err := pcapgo.NewNgReader(fin, pcapgo.DefaultNgReaderOptions)
 	if err != nil {
 		return err
@@ -48,7 +57,11 @@ func TranslateFile(input, output string, config Config) error {
 	if err != nil {
 		return err
 	}
-	defer w.Flush()
+	defer func() {
+		if err := w.Flush(); err != nil {
+			fmt.Println("Failed to flush the output file")
+		}
+	}()
 
 	var packets int
 	var size int
@@ -57,6 +70,8 @@ func TranslateFile(input, output string, config Config) error {
 	lost := false
 	delayOffset := time.Duration(0)
 
+	fmt.Println("pTS\tLost\tDOff\tDelta\tCom\tTS\tTS'\tpTS'")
+	//nolint:gosec
 	for {
 		data, ci, err := r.ReadPacketData()
 		if err != nil {
@@ -69,34 +84,47 @@ func TranslateFile(input, output string, config Config) error {
 		size += len(data)
 
 		p := config.LossProbability
-		if lost {
+		if delayOffset > 0 {
 			p = config.ConseqLossProbability
 		}
 
-		addDelay := false
-		if !previousTs.IsZero() && rand.Float64() < p {
-			lost = true
-		} else {
-			if lost {
-				addDelay = true
-			}
-			lost = false
+		lost = !previousTs.IsZero() && rand.Float64() < p
+
+		if previousTs.IsZero() {
+			previousTs = ci.Timestamp
 		}
 
-		if !previousTs.IsZero() {
-			deltaTotal += ci.Timestamp.Sub(previousTs)
-		}
-		previousTs = ci.Timestamp
+		fmt.Printf("%v\t%v\t%v\t", saneTime(previousTs), lost, delayOffset)
 
 		if !lost {
-			if addDelay {
-				delayOffset += time.Duration(config.DelayAtLoss) * time.Millisecond
+			if delayOffset > 0 {
+				delta := ci.Timestamp.Sub(previousTs)
+				fmt.Printf("D.%d\t", delta)
+				if delta > 0 {
+					compression := delta - (time.Duration(500+rand.Intn(1000)) * time.Microsecond)
+					fmt.Printf("c.%v\t", compression)
+					delayOffset -= compression
+				} else {
+					fmt.Printf("%v\t", 0)
+				}
+			} else {
+				fmt.Printf("*%d\t%v\t", 0, 0)
+				delayOffset = 0
 			}
+			fmt.Printf("%v\t", saneTime(ci.Timestamp))
+			previousTs = ci.Timestamp
 			ci.Timestamp = ci.Timestamp.Add(delayOffset)
+			fmt.Printf("%v\t", saneTime(ci.Timestamp))
 			if err := w.WritePacket(ci, data); err != nil {
 				return err
 			}
+		} else {
+			dv := config.DelayAtLoss - config.DelayErr/2 + (rand.Int63() % config.DelayErr)
+			delayOffset += time.Duration(dv) * time.Millisecond
+			fmt.Printf("%v\t%v\t%v\t%v\t", "LOST", 0, 0, 0)
 		}
+
+		fmt.Printf("%v\n", saneTime(previousTs))
 	}
 	sec := int(deltaTotal.Seconds())
 	if sec == 0 {
@@ -114,7 +142,7 @@ func _main() int {
 		LossProbability:       *lossProbability,
 		ConseqLossProbability: *conseqLossProbability,
 		DelayAtLoss:           *delayAtLoss,
-		DelayVar:              *delayVar,
+		DelayErr:              *delayErr,
 	}
 	if len(*input) == 0 || len(*output) == 0 || *input == *output {
 		fmt.Printf("Improper input/output [%v]/[%v]\n", *input, *output)
